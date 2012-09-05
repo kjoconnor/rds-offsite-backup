@@ -10,43 +10,77 @@ ini_set("max_execution_time", "0");
 $rds = new AmazonRDS(array('key' => $settings['AWS_ACCESS_KEY'],
 							'secret' => $settings['AWS_SECRET_KEY']));
 
-$snapshots = $rds->describe_db_snapshots(array('DBInstanceIdentifier' => $settings['DATABASE_IDENTIFIER'],
-								'SnapshotType' => 'automated'));
+$new_identifier = $settings['DATABASE_IDENTIFIER'] . "-offsite-" . rand(1000,9999);
 
-if(!$snapshots->isOK()) {
-	print "Couldn't get list of snapshots!\n";
+$restore = $rds->restore_db_instance_to_point_in_time($settings['DATABASE_IDENTIFIER'],
+	$new_identifier,
+	array('UseLatestRestorableTime' => 'true',
+		'DBInstanceClass' => $settings['INSTANCE_TYPE'],
+		'MultiAZ' => 'false'));
+
+$new_identifier = 'readability-production-dbserver-1-offsite-9043';
+
+// print_r($restore);
+
+//if restore->isOK
+if(!$restore->isOK()) {
+	print_r($restore);
+	print "Unable to restore DB - " . $new_identifier . "\n";
 	exit(1);
 }
 
-$latest_snapshot = NULL;
+$status = $rds->describe_db_instances(array('DBInstanceIdentifier' => $new_identifier));
 
-foreach($snapshots->body->DescribeDBSnapshotsResult->DBSnapshots->DBSnapshot as $snapshot) {
-	if($latest_snapshot === NULL) {
-		$latest_snapshot = $snapshot;
-	} else if(strtotime($latest_snapshot->SnapshotCreateTime) < strtotime($snapshot->SnapshotCreateTime)) {
-		$latest_snapshot = $snapshot;
-	}
+while($status->body->DescribeDBInstancesResult->DBInstances->DBInstance->DBInstanceStatus !== 'available') {
+	print "Waiting for instance to become available, status is currently " .
+	$status->body->DescribeDBInstancesResult->DBInstances->DBInstance->DBInstanceStatus . "\n";
+	sleep(30);
+	$status = $rds->describe_db_instances(array('DBInstanceIdentifier' => $new_identifier));
 }
 
-if($latest_snapshot === NULL) {
-	print "Couldn't find a snapshot to restore from!\n";
+$create_sg = $rds->create_db_security_group($new_identifier . '-sg', 'Automated SG created for offsite backup.');
+
+if(!$create_sg->isOK()) {
+	print_r($create_sg);
+	print "Unable to create SG - " . $new_identifier . "-sg\n";
 	exit(2);
 }
 
-print_r($latest_snapshot);
+foreach($settings['ALLOWED_IPS'] as $ip) {
+	$modify_sg = $rds->authorize_db_security_group_ingress($new_identifier . "-sg", array(
+		'CIDRIP' => $ip));
 
-$new_identifier = $settings['DATABASE_IDENTIFIER'] . "-offsite-" . base_convert(rand(1000000,9999999), 10, 36);
+	if(!$modify_sg->isOK()) {
+		print_r($modify_sg);
+		print "Unable to modify SG - " . $new_identifier . "-sg, " . $ip . "\n";
+		exit(3);
+	}
+}
 
-$new_instance = $rds->restore_db_instance_from_db_snapshot($latest_snapshot->DBSnapshotIdentifier,
-	$new_identifier,
-	array('DBInstanceClass' => $settings['INSTANCE_TYPE'],
-		'MultiAZ' => 'false')
-	);
+$change_status = $rds->modify_db_instance($new_identifier, array('DBSecurityGroups' => $new_identifier . '-sg',
+	'ApplyImmediately' => 'false',
+	'BackupRetentionPeriod' => 0,
+	'MultiAZ' => 'false',
+	'AutoMinorVersionUpgrade' => 'false'));
 
-print_r($new_instance);
+if(!$change_status->isOK()) {
+	print_r($change_status);
+	print "Unable to modify db instance - " . $new_identifier . "\n";
+	exit(4);
+}
 
-$new_instance_status = $rds->describe_db_instances(array('DBInstanceIdentifier' => $new_identifier));
+// Get hostname here
+$hostname = $status;
 
-print_r($new_instance_status);
+$excluded_tables = '';
+if(isset($settings['EXCLUDED_TABLES'])) {
+	foreach($settings['EXCLUDED_TABLES'] as $excluded_table) {
+		if(!strstr($excluded_table, '.')) {
+			print $excluded_table . " is in the wrong format, should be database.table\n";
+		} else {
+			$excluded_tables .= ' --ignore-table=' . $excluded_table;
+		}
+	}
+}
 
 ?>
